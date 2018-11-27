@@ -145,6 +145,8 @@ class AccountAnalyticAccount(models.Model):
         new_lines = []
         for contract_line in contract.recurring_invoice_line_ids:
             vals = contract_line._convert_to_write(contract_line.read()[0])
+            # Remove template link field named as analytic account field
+            vals.pop('analytic_account_id', False)
             new_lines.append((0, 0, vals))
         return new_lines
 
@@ -197,28 +199,38 @@ class AccountAnalyticAccount(models.Model):
         return invoice_line_vals
 
     @api.multi
-    def _prepare_invoice(self):
+    def _prepare_invoice(self, journal=None):
         self.ensure_one()
         if not self.partner_id:
-            raise ValidationError(
-                _("You must first select a Customer for Contract %s!") %
-                self.name)
-        journal = self.journal_id or self.env['account.journal'].search(
-            [('type', '=', 'sale'),
-             ('company_id', '=', self.company_id.id)],
-            limit=1)
+            if self.contract_type == 'purchase':
+                raise ValidationError(
+                    _("You must first select a Supplier for Contract %s!") %
+                    self.name)
+            else:
+                raise ValidationError(
+                    _("You must first select a Customer for Contract %s!") %
+                    self.name)
+        if not journal:
+            journal = self.journal_id or self.env['account.journal'].search([
+                ('type', '=', self.contract_type),
+                ('company_id', '=', self.company_id.id)
+            ], limit=1)
         if not journal:
             raise ValidationError(
-                _("Please define a sale journal for the company '%s'.") %
-                (self.company_id.name or '',))
+                _("Please define a %s journal for the company '%s'.") %
+                (self.contract_type, self.company_id.name or '')
+            )
         currency = (
             self.pricelist_id.currency_id or
             self.partner_id.property_product_pricelist.currency_id or
             self.company_id.currency_id
         )
+        invoice_type = 'out_invoice'
+        if self.contract_type == 'purchase':
+            invoice_type = 'in_invoice'
         invoice = self.env['account.invoice'].new({
             'reference': self.code,
-            'type': 'out_invoice',
+            'type': invoice_type,
             'partner_id': self.partner_id.address_get(
                 ['invoice'])['invoice'],
             'currency_id': currency.id,
@@ -234,13 +246,34 @@ class AccountAnalyticAccount(models.Model):
         return invoice._convert_to_write(invoice._cache)
 
     @api.multi
-    def _create_invoice(self):
+    def _prepare_invoice_update(self, invoice):
+        vals = self._prepare_invoice()
+        update_vals = {
+            'contract_id': self.id,
+            'date_invoice': vals.get('date_invoice', False),
+            'reference': ' '.join(filter(None, [
+                invoice.reference, vals.get('reference')])),
+            'origin': ' '.join(filter(None, [
+                invoice.origin, vals.get('origin')])),
+        }
+        return update_vals
+
+    @api.multi
+    def _create_invoice(self, invoice=False):
+        """
+        :param invoice: If not False add lines to this invoice
+        :return: invoice created or updated
+        """
         self.ensure_one()
-        invoice_vals = self._prepare_invoice()
-        invoice = self.env['account.invoice'].create(invoice_vals)
+        if invoice and invoice.state == 'draft':
+            invoice.update(self._prepare_invoice_update(invoice))
+        else:
+            invoice = self.env['account.invoice'].create(
+                self._prepare_invoice())
         for line in self.recurring_invoice_line_ids:
             invoice_line_vals = self._prepare_invoice_line(line, invoice.id)
-            self.env['account.invoice.line'].create(invoice_line_vals)
+            if invoice_line_vals:
+                self.env['account.invoice.line'].create(invoice_line_vals)
         invoice.compute_taxes()
         return invoice
 

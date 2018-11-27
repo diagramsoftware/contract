@@ -1,12 +1,19 @@
-# © 2016 Pedro M. Baeza <pedro.baeza@tecnativa.com>
+# Copyright 2016 Tecnativa - Pedro M. Baeza
+# Copyright 2018 Tecnativa - Carlos Dauden
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
 from odoo import _, api, fields, models, exceptions
+from odoo.tools import float_is_zero
 from odoo.tools.safe_eval import safe_eval
 
 
 class AccountAnalyticAccount(models.Model):
     _inherit = "account.analytic.account"
+
+    skip_zero_qty = fields.Boolean(
+        string='Skip Zero Qty Lines',
+        help="If checked, contract lines with 0 qty don't create invoice line",
+    )
 
     @api.model
     def _prepare_invoice_line(self, line, invoice_id):
@@ -23,12 +30,23 @@ class AccountAnalyticAccount(models.Model):
             }
             safe_eval(line.qty_formula_id.code.strip(), eval_context,
                       mode="exec", nocopy=True)  # nocopy for returning result
-            vals['quantity'] = eval_context.get('result', 0)
+            qty = eval_context.get('result', 0)
+            if self.skip_zero_qty and float_is_zero(
+                    qty, self.env['decimal.precision'].precision_get(
+                    'Product Unit of Measure')):
+                # Return empty dict to skip line create
+                vals = {}
+            else:
+                vals['quantity'] = qty
+                # Re-evaluate price with this new quantity
+                vals['price_unit'] = line.with_context(
+                    contract_line_qty=qty,
+                ).price_unit
         return vals
 
 
-class AccountAnalyticInvoiceLine(models.Model):
-    _inherit = 'account.analytic.invoice.line'
+class AccountAnalyticContractLine(models.Model):
+    _inherit = 'account.analytic.contract.line'
 
     qty_type = fields.Selection(
         selection=[
@@ -42,7 +60,7 @@ class AccountAnalyticInvoiceLine(models.Model):
 class ContractLineFormula(models.Model):
     _name = 'contract.line.qty.formula'
 
-    name = fields.Char(required=True)
+    name = fields.Char(required=True, translate=True)
     code = fields.Text(required=True, default="result = 0")
 
     @api.constrains('code')
